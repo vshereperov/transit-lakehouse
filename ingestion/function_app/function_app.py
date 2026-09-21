@@ -1,13 +1,10 @@
 """
-Ingestion layer: Azure Functions that land raw GTFS data in ADLS Gen2.
+Ingestion layer: an Azure Function that lands raw GTFS-Realtime data in ADLS Gen2.
 
-- collect_realtime: every 20 s downloads the GTFS-Realtime vehicle positions
-  feed and stores the raw protobuf as-is.
-- collect_static: once a day (and on startup) downloads the static GTFS zip.
+Every 20 s it downloads the vehicle positions feed and stores the raw protobuf as-is.
 
 Raw layout (container `raw`):
   {city}/vehicle_positions/date=YYYY-MM-DD/hour=HH/vehicle_positions_YYYYMMDDTHHMMSSZ.pb
-  {city}/static_gtfs/date=YYYY-MM-DD/static_gtfs.zip
 
 File names use the feed's own snapshot timestamp (UTC). The source publishes a
 new snapshot about every 30 s while we poll every 20 s, so a snapshot is usually
@@ -39,10 +36,6 @@ FEED_URL = os.environ.get(
     "FEED_VEHICLE_POSITIONS_URL",
     "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb",
 )
-STATIC_GTFS_URL = os.environ.get(
-    "STATIC_GTFS_URL",
-    "https://romamobilita.it/sites/default/files/rome_static_gtfs.zip",
-)
 
 CITY = os.environ.get("CITY", "rome")
 RAW_CONTAINER = os.environ.get("RAW_CONTAINER", "raw")
@@ -50,7 +43,6 @@ FEED_NAME = "vehicle_positions"
 
 USER_AGENT = "transit-lakehouse/0.1"
 FEED_TIMEOUT_S = 8
-STATIC_TIMEOUT_S = 120
 
 # Clients
 
@@ -71,7 +63,7 @@ _http.mount(
 
 
 def blob_service() -> BlobServiceClient:
-    """Managed identity in Azure; connection string as a fallback for local runs."""
+    """Managed identity in Azure, connection string as a fallback for local runs."""
     global _blob_service
     if _blob_service is None:
         conn = os.environ.get("DATALAKE_CONNECTION_STRING")
@@ -112,10 +104,6 @@ def realtime_blob_path(city: str, ts: dt.datetime) -> str:
     )
 
 
-def static_blob_path(city: str, day: dt.date) -> str:
-    return f"{city}/static_gtfs/date={day:%Y-%m-%d}/static_gtfs.zip"
-
-
 def upload_if_new(path: str, data: bytes) -> bool:
     """Returns True if written, False if the blob already existed."""
     client = blob_service().get_blob_client(container=RAW_CONTAINER, blob=path)
@@ -132,8 +120,6 @@ def fetch(url: str, timeout_s: int) -> bytes:
     return resp.content
 
 
-# Functions
-
 @app.timer_trigger(
     schedule="*/20 * * * * *",
     arg_name="timer",
@@ -147,21 +133,3 @@ def collect_realtime(timer: func.TimerRequest) -> None:
         logger.info("saved %s (%d bytes)", path, len(payload))
     else:
         logger.info("duplicate snapshot, skipped %s", path)
-
-
-@app.timer_trigger(
-    schedule="0 0 3 * * *",
-    arg_name="timer",
-    run_on_startup=True,
-    use_monitor=True,
-)
-def collect_static(timer: func.TimerRequest) -> None:
-    today = dt.datetime.now(dt.timezone.utc).date()
-    path = static_blob_path(CITY, today)
-    client = blob_service().get_blob_client(container=RAW_CONTAINER, blob=path)
-    if client.exists():
-        logger.info("static GTFS for %s already stored", today)
-        return
-    payload = fetch(STATIC_GTFS_URL, STATIC_TIMEOUT_S)
-    if upload_if_new(path, payload):
-        logger.info("saved %s (%d bytes)", path, len(payload))
