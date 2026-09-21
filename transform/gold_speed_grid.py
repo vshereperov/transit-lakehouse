@@ -75,7 +75,9 @@ print("all checks passed")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.gold.exports")
 EXPORT = f"/Volumes/{CATALOG}/gold/exports/speed_grid.parquet"
 
-spark.table(TABLE).toPandas().to_parquet(EXPORT, index=False)
+export = spark.table(TABLE).toPandas()
+export.attrs = {}
+export.to_parquet(EXPORT, index=False)
 print(f"exported to {EXPORT}")
 
 # COMMAND ----------
