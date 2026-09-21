@@ -3,6 +3,8 @@ CATALOG = "transit"
 BRONZE = f"{CATALOG}.bronze.vehicle_positions"
 TABLE = f"{CATALOG}.silver.vehicle_segments"
 
+HISTORY_DAYS = 90
+
 MAX_STALENESS_S = 120   # p99 of the lag is 84 s, only 0.11 % sit above 120 s
 MIN_GAP_S = 5           # below this GPS noise dominates the distance
 MAX_GAP_S = 180         # the source publishes every 30 s, a longer gap is a dropout
@@ -35,6 +37,7 @@ dedup = Window.partitionBy("vehicle_id", "vehicle_timestamp").orderBy("feed_time
 
 points = (
     spark.table(BRONZE)
+    .where(F.col("date") >= F.date_sub(F.current_date(), HISTORY_DAYS))
     .where(F.col("vehicle_timestamp").isNotNull())
     .where(F.col("vehicle_id").isNotNull())
     .where(F.col("latitude").between(LAT_MIN, LAT_MAX))

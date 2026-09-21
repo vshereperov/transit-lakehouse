@@ -23,11 +23,13 @@ grid = (
     .withColumn("mid_lon", (F.col("from_lon") + F.col("to_lon")) / 2)
     .withColumn("cell_lat", cell_centre(F.col("mid_lat")))
     .withColumn("cell_lon", cell_centre(F.col("mid_lon")))
-    .groupBy("cell_lat", "cell_lon", "hour_rome")
+    .withColumn("dow", F.expr("weekday(date_rome)"))
+    .groupBy("cell_lat", "cell_lon", "dow", "hour_rome")
     .agg(
         F.count("*").alias("segments"),
         F.countDistinct("vehicle_id").alias("vehicles"),
         F.countDistinct("route_id").alias("routes"),
+        F.countDistinct("date_rome").alias("days"),
         F.round(F.avg("speed_kmh"), 1).alias("avg_speed_kmh"),
         F.round(F.percentile_approx("speed_kmh", 0.5), 1).alias("median_speed_kmh"),
         F.round(F.avg(F.when(F.col("speed_kmh") > 1, 1.0).otherwise(0.0)), 2).alias(
@@ -42,13 +44,14 @@ grid.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(TABLE
 # COMMAND ----------
 CHECKS = {
     "hour_out_of_range": ~F.col("hour_rome").between(0, 23),
+    "dow_out_of_range": ~F.col("dow").between(0, 6),
     "negative_speed": F.col("median_speed_kmh") < 0,
     "cell_outside_rome": ~(
         F.col("cell_lat").between(41.6, 42.2) & F.col("cell_lon").between(12.2, 12.9)
     ),
     "share_out_of_range": ~F.col("moving_share").between(0, 1),
 }
-KEY = ["cell_lat", "cell_lon", "hour_rome"]
+KEY = ["cell_lat", "cell_lon", "dow", "hour_rome"]
 
 grid_tbl = spark.table(TABLE)
 counts = grid_tbl.select(
@@ -68,8 +71,16 @@ if failed:
 print("all checks passed")
 
 # COMMAND ----------
+# The map reads this file
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.gold.exports")
+EXPORT = f"/Volumes/{CATALOG}/gold/exports/speed_grid.parquet"
+
+spark.table(TABLE).toPandas().to_parquet(EXPORT, index=False)
+print(f"exported to {EXPORT}")
+
+# COMMAND ----------
 # MAGIC %sql
-# MAGIC SELECT hour_rome, count(*) AS cells, sum(segments) AS segments,
+# MAGIC SELECT dow, hour_rome, count(*) AS cells, sum(segments) AS segments,
 # MAGIC        round(avg(median_speed_kmh), 1) AS avg_of_median
 # MAGIC FROM transit.gold.speed_grid
-# MAGIC GROUP BY hour_rome ORDER BY hour_rome
+# MAGIC GROUP BY dow, hour_rome ORDER BY dow, hour_rome
