@@ -1,0 +1,4 @@
+streamlit==1.64.0
+pandas==3.0.6
+pyarrow==25.0.1
+pydeck==0.9.3

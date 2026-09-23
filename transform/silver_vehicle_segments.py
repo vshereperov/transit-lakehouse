@@ -5,10 +5,10 @@ TABLE = f"{CATALOG}.silver.vehicle_segments"
 
 HISTORY_DAYS = 90
 
-MAX_STALENESS_S = 120   # p99 of the lag is 84 s, only 0.11 % sit above 120 s
-MIN_GAP_S = 5           # below this GPS noise dominates the distance
-MAX_GAP_S = 180         # the source publishes every 30 s, a longer gap is a dropout
-MAX_SPEED_KMH = 100     # surface transit in Rome cannot do this, it is a GPS jump
+MAX_STALENESS_S = 120
+MIN_GAP_S = 5
+MAX_GAP_S = 180
+MAX_SPEED_KMH = 100
 
 # Rome bounding box
 LAT_MIN, LAT_MAX = 41.6, 42.2
