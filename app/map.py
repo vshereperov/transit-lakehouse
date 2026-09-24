@@ -6,28 +6,65 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-DATA = Path(__file__).parent / "data"
+APP = Path(__file__).parent
+DATA = APP / "data"
 SPEED = DATA / "street_speed.parquet"
 GEOMETRY = DATA / "street_geometry.parquet"
+STYLE = APP / "style.css"
+
+TITLE = "Rome transit speed"
+SUBTITLE = "Median speed of buses and trams on each street, from live GPS"
 
 METRIC = "median_speed_kmh"
 
 MIN_SEGMENTS = 20
+
+WEEK_H = 7 * 24
 
 DOW_NAMES = [
     "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
 ]
 
 PALETTE = [
-    [255, 40, 40], [255, 130, 30], [255, 230, 60], [150, 240, 60],
-    [40, 220, 120], [40, 220, 230], [80, 140, 255],
+    [252, 206, 37], [252, 166, 54], [242, 132, 75], [225, 100, 98],
+    [204, 71, 120], [177, 42, 144], [143, 13, 164],
 ]
+
+EDGES = np.array([5, 10, 15, 20, 30])
 
 ROME = (41.893, 12.482)
 ZOOM = 11
-LINE_M = 6
-LINE_PX_MIN = 1
-LINE_PX_MAX = 4
+LINE_M = 25
+LINE_PX_MIN = 2
+LINE_PX_MAX = 8
+
+ATTRIBUTION = (
+    '<span class="attribution">'
+    '© <a href="https://carto.com/attributions" target="_blank">CARTO</a> '
+    '© <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>'
+    "</span>"
+)
+
+TOOLTIP: Any = {
+    "html": (
+        '<div class="tooltip-street">{street}</div>'
+        '<div class="tooltip-speed"><i style="background:{swatch}"></i>'
+        '<b>{median_speed_kmh} km/h</b><span class="tooltip-muted">median</span></div>'
+        '<div class="tooltip-muted">{vehicles} vehicles · {routes} routes</div>'
+        '<div class="tooltip-muted">moving {moving_pct}% of the time</div>'
+    ),
+    "style": {
+        "color": "#fff",
+        "backgroundColor": "var(--glass-bg)",
+        "backdropFilter": "var(--glass-blur)",
+        "WebkitBackdropFilter": "var(--glass-blur)",
+        "border": "var(--glass-border)",
+        "borderRadius": "12px",
+        "boxShadow": "var(--glass-shadow)",
+        "padding": "10px 14px",
+        "lineHeight": "1.4",
+    },
+}
 
 
 @st.cache_data
@@ -41,108 +78,163 @@ def load() -> pd.DataFrame:
     return speed.merge(geometry, on="way_id")
 
 
-def class_edges(values: pd.Series) -> np.ndarray:
-    """Quantiles over the streets that moved. A median of zero is a state, not a speed,
-    and there are enough of them to swallow a whole class and squash the rest."""
-    quantiles = np.linspace(0, 1, len(PALETTE))
-    return values[values > 0].quantile(quantiles).to_numpy()[1:-1]
-
-
 def classify(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Class 0 is reserved for stopped, so moving streets start at 1."""
     return np.where(values > 0, np.searchsorted(edges, values, side="left") + 1, 0)
 
 
-st.set_page_config(page_title="Rome transit speed", layout="wide")
-st.title("Rome transit speed")
+def css_rgb(colour: list[int]) -> str:
+    r, g, b = colour
+    return f"rgb({r},{g},{b})"
+
+
+def select(df: pd.DataFrame, day: str, hour: int) -> pd.DataFrame:
+    view = df[(df["dow_name"] == day) & (df["hour_rome"] == hour)]
+    view = view[view["segments"] >= MIN_SEGMENTS]
+    colours = [PALETTE[i] for i in classify(view[METRIC].to_numpy(), EDGES)]
+    return view.assign(
+        colour=colours,
+        swatch=[css_rgb(c) for c in colours],
+        moving_pct=(view["moving_share"] * 100).round().astype(int),
+    ).sort_values(METRIC, ascending=False)
+
+
+def nearest_slot(df: pd.DataFrame) -> tuple[int, int]:
+    now = pd.Timestamp.now(tz="Europe/Rome")
+    here = now.weekday() * 24 + now.hour
+    measured = df[df["segments"] >= MIN_SEGMENTS]
+    slots = np.unique(measured["dow"] * 24 + measured["hour_rome"])
+    ahead = (slots - here) % WEEK_H
+    behind = WEEK_H - ahead
+    distance = np.minimum(ahead, behind)
+    best = slots[np.lexsort((ahead < behind, distance))[0]]
+    return divmod(int(best), 24)
+
+
+def controls(df: pd.DataFrame) -> tuple[str, int]:
+    if "start" not in st.session_state:
+        st.session_state["start"] = nearest_slot(df)
+    start_dow, start_hour = st.session_state["start"]
+
+    with st.container(key="controls"):
+        st.title(TITLE, anchor=False)
+        st.caption(SUBTITLE)
+        day = st.segmented_control(
+            "Day",
+            DOW_NAMES,
+            default=DOW_NAMES[start_dow],
+            required=True,
+            format_func=lambda d: d[:3],
+            width="stretch",
+        )
+        hour = st.slider("Hour", 0, 23, start_hour, format="%02d:00")
+    return day, hour
+
+
+def speed_map(view: pd.DataFrame) -> None:
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="dark",
+            initial_view_state=pdk.ViewState(
+                latitude=ROME[0], longitude=ROME[1], zoom=ZOOM
+            ),
+            layers=[
+                pdk.Layer(
+                    "PathLayer",
+                    data=view,
+                    get_path="path",
+                    get_color="colour",
+                    get_width=LINE_M,
+                    width_min_pixels=LINE_PX_MIN,
+                    width_max_pixels=LINE_PX_MAX,
+                    cap_rounded=True,
+                    joint_rounded=True,
+                    pickable=True,
+                    auto_highlight=True,
+                    highlight_color=[255, 255, 255, 220],
+                )
+            ],
+            tooltip=TOOLTIP,
+        ),
+        width="stretch",
+    )
+
+
+def scale() -> str:
+    stopped, *moving = (css_rgb(c) for c in PALETTE)
+    swatches = "".join(f'<i style="background:{c}"></i>' for c in moving)
+    ticks = "".join(
+        f'<span style="left:{100 * i / len(moving):.2f}%">{edge}</span>'
+        for i, edge in enumerate(EDGES, start=1)
+    )
+    return (
+        '<div class="speed-legend">'
+        f'<div class="stop"><i style="background:{stopped}"></i><span>stop</span></div>'
+        f'<div class="scale"><div class="bar">{swatches}</div>'
+        f'<div class="ticks">{ticks}<span class="unit">km/h</span></div></div>'
+        "</div>"
+    )
+
+
+def legend(view: pd.DataFrame, day: str, hour: int) -> None:
+    window = f"{hour:02d}:00–{(hour + 1) % 24:02d}:00"
+    with st.container(key="legend"):
+        if view.empty:
+            st.caption(f"No data for {day}, {window} yet. Try another hour or day.")
+            st.markdown(ATTRIBUTION, unsafe_allow_html=True)
+            return
+
+        st.markdown(scale(), unsafe_allow_html=True)
+        dates = int(view["days"].max())
+        span = f"the last {dates} {day}s" if dates > 1 else f"the last {day}"
+        st.caption(f"{view['segments'].sum():,} measurements, {window} on {span}")
+        with st.container(
+            horizontal=True,
+            horizontal_alignment="distribute",
+            vertical_alignment="center",
+            gap="xsmall",
+        ):
+            table_button(view)
+            st.markdown(ATTRIBUTION, unsafe_allow_html=True, width="content")
+
+
+@st.fragment
+def table_button(view: pd.DataFrame) -> None:
+    if st.button("Table", icon=":material/table_rows:", type="tertiary"):
+        show_table(view)
+
+
+@st.dialog("Streets", width="large")
+def show_table(view: pd.DataFrame) -> None:
+    columns = [
+        "street", METRIC, "avg_speed_kmh", "moving_share", "routes", "vehicles", "segments",
+    ]
+    st.dataframe(
+        view[columns].sort_values(METRIC),
+        column_config={
+            "street": st.column_config.TextColumn("Street"),
+            METRIC: st.column_config.NumberColumn("Median, km/h", format="%.1f"),
+            "avg_speed_kmh": st.column_config.NumberColumn("Average, km/h", format="%.1f"),
+            "moving_share": st.column_config.NumberColumn("Moving", format="percent"),
+            "routes": st.column_config.NumberColumn("Routes"),
+            "vehicles": st.column_config.NumberColumn("Vehicles"),
+            "segments": st.column_config.NumberColumn("Measurements"),
+        },
+        width="stretch",
+        hide_index=True,
+    )
+
+
+st.set_page_config(page_title=TITLE, page_icon=":material/directions_bus:", layout="wide")
+st.html(f"<style>{STYLE.read_text(encoding='utf-8')}</style>")
 
 missing = [f.name for f in (SPEED, GEOMETRY) if not f.exists()]
 if missing:
+    st.title(TITLE, anchor=False)
     st.error(f"Missing {', '.join(missing)} in {DATA}. Export them from Databricks.")
     st.stop()
 
 df = load()
-
-EDGES = class_edges(df[df["segments"] >= MIN_SEGMENTS][METRIC])
-
-left, middle = st.columns(2)
-with left:
-    present = df.groupby("dow_name")["segments"].sum().sort_values(ascending=False)
-    days = [d for d in DOW_NAMES if d in present.index]
-    day = st.selectbox("Day", days, index=days.index(present.index[0]))
-with middle:
-    hour = st.slider("Hour", 0, 23, 8)
-view = df[(df["dow_name"] == day) & (df["hour_rome"] == hour)]
-view = view[view["segments"] >= MIN_SEGMENTS]
-
-if view.empty:
-    st.warning("Nothing recorded for this combination yet. Try another hour or day.")
-    st.stop()
-
-classes = classify(view[METRIC].to_numpy(), EDGES)
-view = view.assign(
-    colour=[PALETTE[i] for i in classes],
-    moving_pct=(view["moving_share"] * 100).round().astype(int),
-)
-
-TOOLTIP: Any = {
-    "html": (
-        "<b>{street}</b><br/>"
-        "<b>{median_speed_kmh} km/h</b> median, {avg_speed_kmh} average<br/>"
-        "{segments} observations, {vehicles} vehicles, {routes} routes<br/>"
-        "moving {moving_pct}% of the time, over {days} day(s)"
-    )
-}
-
-st.pydeck_chart(
-    pdk.Deck(
-        map_style="dark",
-        initial_view_state=pdk.ViewState(
-            latitude=ROME[0], longitude=ROME[1], zoom=ZOOM
-        ),
-        layers=[
-            pdk.Layer(
-                "PathLayer",
-                data=view,
-                get_path="path",
-                get_color="colour",
-                get_width=LINE_M,
-                width_min_pixels=LINE_PX_MIN,
-                width_max_pixels=LINE_PX_MAX,
-                cap_rounded=True,
-                joint_rounded=True,
-                opacity=0.9,
-                pickable=True,
-            )
-        ],
-        tooltip=TOOLTIP,
-    ),
-    width="stretch",
-)
-
-bar = "".join(
-    f'<td style="background:rgb({r},{g},{b});height:14px"></td>' for r, g, b in PALETTE
-)
-slowest, fastest = view[METRIC].min(), view[METRIC].max()
-st.markdown(
-    f'<table style="width:100%;border-spacing:0"><tr>{bar}</tr></table>'
-    '<div style="display:flex;justify-content:space-between;font-size:0.8rem">'
-    f"<span>{slowest:.0f} km/h</span><span>{fastest:.0f} km/h</span></div>",
-    unsafe_allow_html=True,
-)
-
-dates = int(view["days"].max())
-span = f"the last {dates} {day}s" if dates > 1 else f"the last {day}"
-st.caption(f"{view['segments'].sum():,} measurements over {span}.")
-
-with st.expander("Table"):
-    st.dataframe(
-        view[
-            [
-                "street", "highway", "median_speed_kmh", "avg_speed_kmh",
-                "moving_share", "segments", "vehicles", "routes", "days", "snap_m",
-            ]
-        ].sort_values(METRIC),
-        width="stretch",
-        hide_index=True,
-    )
+day, hour = controls(df)
+view = select(df, day, hour)
+speed_map(view)
+legend(view, day, hour)
