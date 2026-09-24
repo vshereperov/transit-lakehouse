@@ -6,11 +6,8 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-APP = Path(__file__).parent
-DATA = APP / "data"
-SPEED = DATA / "street_speed.parquet"
-GEOMETRY = DATA / "street_geometry.parquet"
-STYLE = APP / "style.css"
+STYLE = Path(__file__).parent / "style.css"
+SERVING = "https://sttransitlake.blob.core.windows.net/serving/rome"
 
 TITLE = "Rome transit speed"
 SUBTITLE = "Median speed of buses and trams on each street, from live GPS"
@@ -67,11 +64,12 @@ TOOLTIP: Any = {
 }
 
 
-@st.cache_data
+@st.cache_data(ttl=3600)
 def load() -> pd.DataFrame:
-    speed = pd.read_parquet(SPEED)
+    sas = st.secrets["serving_sas"]
+    speed = pd.read_parquet(f"{SERVING}/street_speed.parquet?{sas}")
     speed["dow_name"] = speed["dow"].map(dict(enumerate(DOW_NAMES)))
-    geometry = pd.read_parquet(GEOMETRY)
+    geometry = pd.read_parquet(f"{SERVING}/street_geometry.parquet?{sas}")
     geometry["path"] = geometry["path"].apply(
         lambda path: [[float(lon), float(lat)] for lon, lat in path]
     )
@@ -226,12 +224,6 @@ def show_table(view: pd.DataFrame) -> None:
 
 st.set_page_config(page_title=TITLE, page_icon=":material/directions_bus:", layout="wide")
 st.html(f"<style>{STYLE.read_text(encoding='utf-8')}</style>")
-
-missing = [f.name for f in (SPEED, GEOMETRY) if not f.exists()]
-if missing:
-    st.title(TITLE, anchor=False)
-    st.error(f"Missing {', '.join(missing)} in {DATA}. Export them from Databricks.")
-    st.stop()
 
 df = load()
 day, hour = controls(df)

@@ -129,7 +129,10 @@ if failed:
 print("all checks passed")
 
 # COMMAND ----------
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.gold.exports")
+SERVING = "abfss://serving@sttransitlake.dfs.core.windows.net/rome"
+spark.sql(
+    f"CREATE EXTERNAL VOLUME IF NOT EXISTS {CATALOG}.gold.exports LOCATION '{SERVING}'"
+)
 EXPORTS = f"/Volumes/{CATALOG}/gold/exports"
 
 drawn = table.select("way_id").distinct()
