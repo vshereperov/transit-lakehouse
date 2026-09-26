@@ -7,7 +7,11 @@ HIGHWAYS = (
     "motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street"
     "|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link"
 )
-OVERPASS = "https://overpass-api.de/api/interpreter"
+OVERPASS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
 USER_AGENT = "transit-lakehouse/0.1"
 
 # COMMAND ----------
@@ -15,6 +19,7 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.silver")
 
 # COMMAND ----------
 import math
+import time
 
 import requests
 
@@ -35,12 +40,22 @@ def metres(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 # COMMAND ----------
-response = requests.post(
-    OVERPASS, data={"data": QUERY}, headers={"User-Agent": USER_AGENT}, timeout=600
-)
-response.raise_for_status()
-ways = [w for w in response.json()["elements"] if w.get("geometry")]
-print(f"{len(ways):,} ways")
+ways = None
+for url in OVERPASS:
+    try:
+        response = requests.post(
+            url, data={"data": QUERY}, headers={"User-Agent": USER_AGENT}, timeout=600
+        )
+        response.raise_for_status()
+        ways = [w for w in response.json()["elements"] if w.get("geometry")]
+        print(f"{len(ways):,} ways from {url}")
+        break
+    except Exception as refused:
+        print(f"{url}: {refused}")
+        time.sleep(5)
+
+if not ways:
+    raise RuntimeError("every Overpass mirror refused")
 
 # COMMAND ----------
 edges = []
