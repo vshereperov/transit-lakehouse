@@ -1,21 +1,8 @@
 """
-Ingestion layer: Azure Functions that land raw GTFS data in ADLS Gen2.
+Azure Functions that save raw GTFS data to ADLS Gen2 as-is.
 
-- collect_realtime: every 20 s downloads the vehicle positions feed and stores the
-  raw protobuf as-is.
-- collect_static: once a day downloads the GTFS zip, which carries the route shapes
-  the speed is mapped onto.
-
-Raw layout (container `raw`):
-  {city}/vehicle_positions/date=YYYY-MM-DD/hour=HH/vehicle_positions_YYYYMMDDTHHMMSSZ.pb
-  {city}/static_gtfs/date=YYYY-MM-DD/static_gtfs.zip
-
-File names use the feed's own snapshot timestamp (UTC). The source publishes a
-new snapshot about every 30 s while we poll every 20 s, so a snapshot is usually
-fetched twice: the second upload hits an existing name and is skipped. Result:
-no duplicates, no missed snapshots.
-
-City-agnostic: any city with a GTFS-RT feed works by changing app settings.
+- collect_realtime: the vehicle positions feed, every 20 s.
+- collect_static: the static GTFS zip with route shapes, once a day.
 """
 
 import datetime as dt
@@ -50,8 +37,8 @@ RAW_CONTAINER = os.environ.get("RAW_CONTAINER", "raw")
 FEED_NAME = "vehicle_positions"
 
 USER_AGENT = "transit-lakehouse/0.1"
-FEED_TIMEOUT_S = 8
-STATIC_TIMEOUT_S = 120
+FEED_TIMEOUT_S = 8 # Maximum wait for one snapshot of the vehicle positions feed
+STATIC_TIMEOUT_S = 120 # Maximum wait for the static GTFS zip
 
 # Clients
 
@@ -72,35 +59,27 @@ _http.mount(
 
 
 def blob_service() -> BlobServiceClient:
-    """Managed identity in Azure, connection string as a fallback for local runs."""
+    """Authenticates with the function's managed identity."""
     global _blob_service
     if _blob_service is None:
-        conn = os.environ.get("DATALAKE_CONNECTION_STRING")
-        if conn:
-            _blob_service = BlobServiceClient.from_connection_string(conn)
-        else:
-            _blob_service = BlobServiceClient(
-                account_url=os.environ["DATALAKE_ACCOUNT_URL"],
-                credential=DefaultAzureCredential(),
-            )
+        _blob_service = BlobServiceClient(
+            account_url=os.environ["DATALAKE_ACCOUNT_URL"],
+            credential=DefaultAzureCredential(),
+        )
     return _blob_service
 
 
 # Helpers
 
 def snapshot_time(payload: bytes) -> dt.datetime:
-    """
-    Snapshot time (UTC) that gives the blob its name.
-
-    Doubles as a sanity check on the download: the source serves the feed as
-    text/html, so the content type tells us nothing, and arbitrary bytes can
-    occasionally parse as valid protobuf. A feed with no entities is not one.
-    """
-    msg = gtfs_realtime_pb2.FeedMessage()
-    msg.ParseFromString(payload)
-    if not msg.entity:
+    """Returns the feed's snapshot time (UTC), rejecting empty feeds."""
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(payload)
+    if not feed.entity:
         raise ValueError("payload parsed as protobuf but carries no entities")
-    ts = msg.header.timestamp or max(e.vehicle.timestamp for e in msg.entity)
+    ts = feed.header.timestamp or max(
+        entity.vehicle.timestamp for entity in feed.entity
+    )
     if not ts:
         raise ValueError("feed carries no timestamp")
     return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc)
@@ -133,6 +112,8 @@ def fetch(url: str, timeout_s: int) -> bytes:
     return resp.content
 
 
+# Timer-triggered functions
+
 @app.timer_trigger(
     schedule="*/20 * * * * *",
     arg_name="timer",
@@ -140,6 +121,7 @@ def fetch(url: str, timeout_s: int) -> bytes:
     use_monitor=False,
 )
 def collect_realtime(timer: func.TimerRequest) -> None:
+    """Saves the current vehicle positions snapshot every 20 s."""
     payload = fetch(FEED_URL, FEED_TIMEOUT_S)
     path = realtime_blob_path(CITY, snapshot_time(payload))
     if upload_if_new(path, payload):
@@ -155,6 +137,7 @@ def collect_realtime(timer: func.TimerRequest) -> None:
     use_monitor=True,
 )
 def collect_static(timer: func.TimerRequest) -> None:
+    """Saves today's static GTFS zip once a day at 03:00 UTC."""
     today = dt.datetime.now(dt.timezone.utc).date()
     path = static_blob_path(CITY, today)
     client = blob_service().get_blob_client(container=RAW_CONTAINER, blob=path)
