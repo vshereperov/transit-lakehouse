@@ -14,8 +14,6 @@ SUBTITLE = "Median speed of buses and trams on each street, from live GPS"
 
 METRIC = "median_speed_kmh"
 
-MIN_SEGMENTS = 20
-
 WEEK_H = 7 * 24
 
 DOW_NAMES = [
@@ -87,7 +85,6 @@ def css_rgb(colour: list[int]) -> str:
 
 def select(df: pd.DataFrame, day: str, hour: int) -> pd.DataFrame:
     view = df[(df["dow_name"] == day) & (df["hour_rome"] == hour)]
-    view = view[view["segments"] >= MIN_SEGMENTS]
     colours = [PALETTE[i] for i in classify(view[METRIC].to_numpy(), EDGES)]
     return view.assign(
         colour=colours,
@@ -99,8 +96,7 @@ def select(df: pd.DataFrame, day: str, hour: int) -> pd.DataFrame:
 def nearest_slot(df: pd.DataFrame) -> tuple[int, int]:
     now = pd.Timestamp.now(tz="Europe/Rome")
     here = now.weekday() * 24 + now.hour
-    measured = df[df["segments"] >= MIN_SEGMENTS]
-    slots = np.unique(measured["dow"] * 24 + measured["hour_rome"])
+    slots = np.unique(df["dow"] * 24 + df["hour_rome"])
     ahead = (slots - here) % WEEK_H
     behind = WEEK_H - ahead
     distance = np.minimum(ahead, behind)
