@@ -28,6 +28,7 @@ and served on an interactive map.
 - [Design decisions](#design-decisions)
 - [Data quality](#data-quality)
 - [Repository layout](#repository-layout)
+- [Deploy](#deploy)
 - [Possible improvements](#possible-improvements)
 - [License and acknowledgments](#license-and-acknowledgments)
 
@@ -113,6 +114,8 @@ A street gets a speed for a weekday and hour only from at least 20 measurements.
 │   ├── function_app/     Azure Function
 │   └── local_test.py     prints a sample of the feed
 ├── transform/            Databricks notebooks
+├── resources/            Databricks job definitions
+├── databricks.yml        Databricks Asset Bundle
 ├── app/
 │   ├── map.py            Streamlit map
 │   └── style.css         map styles
@@ -120,6 +123,19 @@ A street gets a speed for a weekday and hour only from at least 20 measurements.
 │   └── config.toml       dark theme
 └── docs/
     └── map.png           screenshot for this README
+```
+
+## Deploy
+
+The Databricks jobs are defined as a [Databricks Asset Bundle](databricks.yml) with two
+targets, `dev` and `prod`. Set `BUNDLE_VAR_notification_email` to the address for failure
+alerts, then:
+
+```bash
+databricks bundle validate
+databricks bundle deploy             # dev
+databricks bundle run daily          # run the dev job
+databricks bundle deploy -t prod
 ```
 
 ## Possible improvements
