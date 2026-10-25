@@ -1,11 +1,8 @@
 # Databricks notebook source
-# MAGIC %pip install --no-deps gtfs-realtime-bindings==2.2.0
-
-# COMMAND ----------
-dbutils.library.restartPython()
-
-# COMMAND ----------
-CATALOG = "transit"
+dbutils.widgets.text("bronze_catalog", "transit")
+dbutils.widgets.text("ingest", "false")
+CATALOG = dbutils.widgets.get("bronze_catalog")
+INGEST = dbutils.widgets.get("ingest") == "true"
 SCHEMA = "bronze"
 TABLE = f"{CATALOG}.{SCHEMA}.vehicle_positions"
 
@@ -17,9 +14,10 @@ CHECKPOINT = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints/vehicle_positions"
 MAX_LAG_MIN = 60 # Maximum age of the newest snapshot to consider data fresh
 
 # COMMAND ----------
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG} MANAGED LOCATION '{CATALOG_LOCATION}'")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints")
+if INGEST:
+    spark.sql(f"CREATE CATALOG IF NOT EXISTS {CATALOG} MANAGED LOCATION '{CATALOG_LOCATION}'")
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints")
 
 # COMMAND ----------
 # Snapshot parser
@@ -119,47 +117,49 @@ def parse_snapshot(payload):
 # COMMAND ----------
 # Incremental load from raw
 
-files = (
-    spark.readStream.format("cloudFiles")
-    .option("cloudFiles.format", "binaryFile")
-    .option("pathGlobFilter", "*.pb")
-    .load(RAW_PATH)
-    .withColumnRenamed("path", "source_file")
-)
+if INGEST:
+    files = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "binaryFile")
+        .option("pathGlobFilter", "*.pb")
+        .load(RAW_PATH)
+        .withColumnRenamed("path", "source_file")
+    )
 
-rows = (
-    files.select("source_file", F.explode(parse_snapshot("content")).alias("r"))
-    .select("source_file", "r.*")
-    .withColumn("feed_timestamp", F.timestamp_seconds("feed_timestamp"))
-    .withColumn("vehicle_timestamp", F.timestamp_seconds("vehicle_timestamp"))
-    .withColumn("date", F.to_date("feed_timestamp"))
-    .withColumn("ingested_at", F.current_timestamp())
-)
+    rows = (
+        files.select("source_file", F.explode(parse_snapshot("content")).alias("r"))
+        .select("source_file", "r.*")
+        .withColumn("feed_timestamp", F.timestamp_seconds("feed_timestamp"))
+        .withColumn("vehicle_timestamp", F.timestamp_seconds("vehicle_timestamp"))
+        .withColumn("date", F.to_date("feed_timestamp"))
+        .withColumn("ingested_at", F.current_timestamp())
+    )
 
-(
-    rows.writeStream.option("checkpointLocation", CHECKPOINT)
-    .trigger(availableNow=True)
-    .partitionBy("date")
-    .toTable(TABLE)
-    .awaitTermination()
-)
+    (
+        rows.writeStream.option("checkpointLocation", CHECKPOINT)
+        .trigger(availableNow=True)
+        .partitionBy("date")
+        .toTable(TABLE)
+        .awaitTermination()
+    )
 
 # COMMAND ----------
 # Freshness check
 
-lag_s = (
-    spark.table(TABLE)
-    .where(F.col("date") >= F.date_sub(F.current_date(), 1))
-    .agg(
-        (
-            F.unix_timestamp(F.current_timestamp())
-            - F.unix_timestamp(F.max("feed_timestamp"))
-        ).alias("lag_s")
+if INGEST:
+    lag_s = (
+        spark.table(TABLE)
+        .where(F.col("date") >= F.date_sub(F.current_date(), 1))
+        .agg(
+            (
+                F.unix_timestamp(F.current_timestamp())
+                - F.unix_timestamp(F.max("feed_timestamp"))
+            ).alias("lag_s")
+        )
+        .first()["lag_s"]
     )
-    .first()["lag_s"]
-)
-if lag_s is None:
-    raise AssertionError("bronze has no snapshots since yesterday")
-if lag_s > MAX_LAG_MIN * 60:
-    raise AssertionError(f"bronze is stale: newest snapshot is {lag_s // 60} min old")
-print(f"bronze is fresh: newest snapshot is {lag_s // 60} min old")
+    if lag_s is None:
+        raise AssertionError("bronze has no snapshots since yesterday")
+    if lag_s > MAX_LAG_MIN * 60:
+        raise AssertionError(f"bronze is stale: newest snapshot is {lag_s // 60} min old")
+    print(f"bronze is fresh: newest snapshot is {lag_s // 60} min old")

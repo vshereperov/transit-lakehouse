@@ -1,5 +1,8 @@
 # Databricks notebook source
-CATALOG = "transit"
+dbutils.widgets.text("catalog", "transit_dev")
+dbutils.widgets.text("serving", "abfss://serving@sttransitlake.dfs.core.windows.net/dev/rome")
+CATALOG = dbutils.widgets.get("catalog")
+SERVING = dbutils.widgets.get("serving")
 SEGMENTS = f"{CATALOG}.silver.vehicle_segments"
 EDGES = f"{CATALOG}.silver.street_edges"
 ROUTE_STREETS = f"{CATALOG}.silver.route_streets"
@@ -167,7 +170,6 @@ print("all checks passed")
 # COMMAND ----------
 # Export for the map
 
-SERVING = "abfss://serving@sttransitlake.dfs.core.windows.net/rome"
 spark.sql(
     f"CREATE EXTERNAL VOLUME IF NOT EXISTS {CATALOG}.gold.exports LOCATION '{SERVING}'"
 )

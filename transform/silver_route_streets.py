@@ -1,5 +1,6 @@
 # Databricks notebook source
-CATALOG = "transit"
+dbutils.widgets.text("catalog", "transit_dev")
+CATALOG = dbutils.widgets.get("catalog")
 EDGES = f"{CATALOG}.silver.street_edges"
 ROUTE_STREETS = f"{CATALOG}.silver.route_streets"
 TRIP_SHAPE = f"{CATALOG}.silver.trip_shape"

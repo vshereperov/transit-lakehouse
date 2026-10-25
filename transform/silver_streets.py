@@ -1,5 +1,6 @@
 # Databricks notebook source
-CATALOG = "transit"
+dbutils.widgets.text("catalog", "transit_dev")
+CATALOG = dbutils.widgets.get("catalog")
 TABLE = f"{CATALOG}.silver.street_edges"
 
 BBOX = (41.68, 12.20, 42.10, 12.75) # Rome bounding box

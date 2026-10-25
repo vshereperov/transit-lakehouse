@@ -1,6 +1,8 @@
 # Databricks notebook source
-CATALOG = "transit"
-BRONZE = f"{CATALOG}.bronze.vehicle_positions"
+dbutils.widgets.text("catalog", "transit_dev")
+dbutils.widgets.text("bronze_catalog", "transit")
+CATALOG = dbutils.widgets.get("catalog")
+BRONZE = f"{dbutils.widgets.get('bronze_catalog')}.bronze.vehicle_positions"
 TABLE = f"{CATALOG}.silver.vehicle_segments"
 
 HISTORY_DAYS = 90 # Keep this many days of history in the table
