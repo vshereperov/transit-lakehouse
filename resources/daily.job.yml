@@ -1,0 +1,66 @@
+resources:
+  jobs:
+    daily:
+      name: transit-lakehouse-daily
+      performance_target: STANDARD
+      schedule:
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: UTC
+      queue:
+        enabled: true
+      max_concurrent_runs: 1
+      timeout_seconds: 1800
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 900
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.notification_email}
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: bronze_catalog
+          default: ${var.bronze_catalog}
+        - name: ingest
+          default: ${var.ingest}
+        - name: serving
+          default: ${var.serving}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+            dependencies:
+              - gtfs-realtime-bindings==2.2.0
+      tasks:
+        - task_key: bronze
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/bronze_vehicle_positions.py
+          max_retries: 2
+          min_retry_interval_millis: 180000
+        - task_key: silver_vehicle_segments
+          depends_on:
+            - task_key: bronze
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/silver_vehicle_segments.py
+          max_retries: 1
+          min_retry_interval_millis: 180000
+        - task_key: silver_route_streets
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/silver_route_streets.py
+          max_retries: 1
+          min_retry_interval_millis: 180000
+        - task_key: gold
+          depends_on:
+            - task_key: silver_vehicle_segments
+            - task_key: silver_route_streets
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/gold_street_speed.py
+          max_retries: 0

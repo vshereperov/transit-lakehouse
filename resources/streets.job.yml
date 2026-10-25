@@ -1,0 +1,21 @@
+resources:
+  jobs:
+    streets:
+      name: transit-lakehouse-streets
+      performance_target: STANDARD
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+      parameters:
+        - name: catalog
+          default: ${var.catalog}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+      tasks:
+        - task_key: silver_streets
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/silver_streets.py
+          max_retries: 0
