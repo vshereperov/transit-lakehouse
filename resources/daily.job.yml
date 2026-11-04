@@ -9,7 +9,7 @@ resources:
       queue:
         enabled: true
       max_concurrent_runs: 1
-      timeout_seconds: 1800
+      timeout_seconds: 3600
       health:
         rules:
           - metric: RUN_DURATION_SECONDS
@@ -29,6 +29,8 @@ resources:
           default: ${var.ingest}
         - name: serving
           default: ${var.serving}
+        - name: full_refresh
+          default: "false"
       environments:
         - environment_key: default
           spec:
@@ -56,10 +58,18 @@ resources:
             notebook_path: ../transform/silver_route_streets.py
           max_retries: 1
           min_retry_interval_millis: 180000
-        - task_key: gold
+        - task_key: silver_segment_streets
           depends_on:
             - task_key: silver_vehicle_segments
             - task_key: silver_route_streets
+          environment_key: default
+          notebook_task:
+            notebook_path: ../transform/silver_segment_streets.py
+          max_retries: 1
+          min_retry_interval_millis: 180000
+        - task_key: gold
+          depends_on:
+            - task_key: silver_segment_streets
           environment_key: default
           notebook_task:
             notebook_path: ../transform/gold_street_speed.py

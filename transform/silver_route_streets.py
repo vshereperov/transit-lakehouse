@@ -1,12 +1,15 @@
 # Databricks notebook source
 dbutils.widgets.text("catalog", "transit_dev")
+dbutils.widgets.text("full_refresh", "false")
 CATALOG = dbutils.widgets.get("catalog")
+FULL_REFRESH = dbutils.widgets.get("full_refresh") == "true"
 EDGES = f"{CATALOG}.silver.street_edges"
-ROUTE_STREETS = f"{CATALOG}.silver.route_streets"
+SHAPE_STREETS = f"{CATALOG}.silver.shape_streets"
 TRIP_SHAPE = f"{CATALOG}.silver.trip_shape"
 STATIC_PATH = "abfss://raw@sttransitlake.dfs.core.windows.net/rome/static_gtfs/"
 
 HISTORY_DAYS = 90 # Keep this many days of static GTFS versions in the tables
+MIN_SIZE_SHARE = 0.8 # A zip smaller than this share of the previous one is a truncated release
 
 MAX_SNAP_M = 25 # Maximum distance to snap a shape point to a street edge
 MIN_SPAN_M = 30 # Minimum distance that a route must run along a street to be considered a match
@@ -16,6 +19,8 @@ SHAPE_STEP_M = 5 # Step between the points a route line is resampled into
 
 # COMMAND ----------
 # GTFS parsers and geometry
+
+from datetime import date, timedelta
 
 from pyspark.sql import Window
 from pyspark.sql import functions as F
@@ -120,39 +125,86 @@ def point_to_edge_m(lat, lon, from_lat, from_lon, to_lat, to_lon):
     return F.sqrt((x - closest_x) * (x - closest_x) + (y - closest_y) * (y - closest_y))
 
 # COMMAND ----------
-# Parse static GTFS zips
+# Pick new static GTFS zips
 
-done = []
-if spark.catalog.tableExists(ROUTE_STREETS):
-    done = [
+REBUILD = FULL_REFRESH or not spark.catalog.tableExists(TRIP_SHAPE)
+done = set()
+if not REBUILD:
+    done = {
         row.static_date
-        for row in spark.table(ROUTE_STREETS).select("static_date").distinct().collect()
-    ]
+        for row in spark.table(TRIP_SHAPE).select("static_date").distinct().collect()
+    }
 
-new_zips = (
+zips = (
     spark.read.format("binaryFile")
     .load(STATIC_PATH)
     .withColumnRenamed("date", "static_date")
-    .where(F.col("static_date") >= F.date_sub(F.current_date(), HISTORY_DAYS))
-    .where(~F.col("static_date").isin(done))
 )
+
+accepted, last_size = [], None
+for row in zips.select("static_date", "length").orderBy("static_date").collect():
+    if row.static_date in done or not last_size or row.length >= MIN_SIZE_SHARE * last_size:
+        accepted.append(row.static_date)
+    last_size = row.length
+
+cutoff = date.today() - timedelta(days=HISTORY_DAYS)
+version_cutoff = max((day for day in accepted if day <= cutoff), default=accepted[0])
+new_dates = [day for day in accepted if day >= version_cutoff and day not in done]
+print(f"new versions: {new_dates}")
+
+# COMMAND ----------
+# Drop versions outside the history window
+
+if not REBUILD:
+    spark.sql(f"DELETE FROM {TRIP_SHAPE} WHERE static_date < '{version_cutoff}'")
+    spark.sql(
+        f"DELETE FROM {SHAPE_STREETS} "
+        f"WHERE shape_hash NOT IN (SELECT shape_hash FROM {TRIP_SHAPE})"
+    )
+
+if not new_dates:
+    dbutils.notebook.exit("up to date")
+
+# COMMAND ----------
+# Parse new zips and hash every route line
+
+new_zips = zips.where(F.col("static_date").isin(new_dates))
 
 trips = new_zips.select(
     "static_date", F.explode(parse_trips("content")).alias("trip")
 ).select("static_date", "trip.*")
-trips.write.mode("overwrite").option("partitionOverwriteMode", "dynamic").partitionBy(
-    "static_date"
-).saveAsTable(TRIP_SHAPE)
 
-shape = Window.partitionBy("static_date", "shape_id").orderBy("seq")
+points = new_zips.select(
+    "static_date", F.explode(parse_shapes("content")).alias("point")
+).select("static_date", "point.*")
+
+hashes = points.join(
+    trips.select("static_date", "shape_id").distinct(), ["static_date", "shape_id"]
+).groupBy("static_date", "shape_id").agg(
+    F.md5(
+        F.to_json(F.array_sort(F.collect_list(F.struct("seq", "lat", "lon"))))
+    ).alias("shape_hash")
+)
+
+new_shapes = hashes.groupBy("shape_hash").agg(
+    F.min(F.struct("static_date", "shape_id")).alias("first")
+).select("shape_hash", "first.*")
+if not REBUILD:
+    known = spark.table(TRIP_SHAPE).select("shape_hash").distinct()
+    new_shapes = new_shapes.join(known, "shape_hash", "left_anti")
+
+new_hashes = [row.shape_hash for row in new_shapes.select("shape_hash").collect()]
+print(f"new route lines: {len(new_hashes)}")
+
+shape = Window.partitionBy("shape_hash").orderBy("seq")
 next_lat, next_lon = F.lead("lat").over(shape), F.lead("lon").over(shape)
 gap_m = distance_m(F.col("lat"), F.col("lon"), F.col("next_lat"), F.col("next_lon"))
 steps = F.greatest(F.ceil(F.col("gap_m") / SHAPE_STEP_M), F.lit(1)).cast("int")
 along = F.col("step") / F.col("steps")
 
 shape_points = (
-    new_zips.select("static_date", F.explode(parse_shapes("content")).alias("point"))
-    .select("static_date", "point.*")
+    points.join(new_shapes, ["static_date", "shape_id"])
+    .select("shape_hash", "seq", "lat", "lon")
     .withColumn("next_lat", next_lat)
     .withColumn("next_lon", next_lon)
     .where(F.col("next_lat").isNotNull())
@@ -195,21 +247,21 @@ candidates = point_cells.join(edges, ["cell_lat", "cell_lon"]).withColumn(
     ),
 )
 
-nearest = Window.partitionBy("static_date", "shape_id", "seq", "step").orderBy("snap_m")
+nearest = Window.partitionBy("shape_hash", "seq", "step").orderBy("snap_m", "way_id")
 matched = (
     candidates.withColumn("rank", F.row_number().over(nearest))
     .where((F.col("rank") == 1) & (F.col("snap_m") <= MAX_SNAP_M))
 )
 
 # COMMAND ----------
-# Match routes to streets
+# Match route lines to streets
 
 street_length = (
     spark.table(EDGES).groupBy("way_id").agg(F.sum("length_m").alias("street_m"))
 )
 
-route_streets = (
-    matched.groupBy("static_date", "shape_id", "way_id")
+shape_streets = (
+    matched.groupBy("shape_hash", "way_id")
     .agg(
         F.count("*").alias("points"),
         F.round(F.avg("snap_m"), 1).alias("snap_m"),
@@ -217,18 +269,27 @@ route_streets = (
     )
     .join(street_length, "way_id")
     .where(F.col("span_m") >= F.least(F.lit(float(MIN_SPAN_M)), F.col("street_m")))
-    .select(
-        "static_date", "shape_id", "way_id", "points", "snap_m", "street_m", "span_m"
-    )
+    .select("shape_hash", "way_id", "points", "snap_m", "street_m", "span_m")
 )
 
-route_streets.write.mode("overwrite").option(
-    "partitionOverwriteMode", "dynamic"
-).partitionBy("static_date").saveAsTable(ROUTE_STREETS)
-
 # COMMAND ----------
-# Drop versions outside the history window
+# Write tables
 
-cutoff = f"date_sub(current_date(), {HISTORY_DAYS})"
-for table in (TRIP_SHAPE, ROUTE_STREETS):
-    spark.sql(f"DELETE FROM {table} WHERE static_date < {cutoff}")
+if REBUILD:
+    shape_streets.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+        SHAPE_STREETS
+    )
+elif new_hashes:
+    hash_list = ", ".join(f"'{shape_hash}'" for shape_hash in new_hashes)
+    shape_streets.write.mode("overwrite").option(
+        "replaceWhere", f"shape_hash IN ({hash_list})"
+    ).saveAsTable(SHAPE_STREETS)
+
+trip_shape = trips.join(hashes, ["static_date", "shape_id"]).select(
+    "static_date", "trip_id", "shape_id", "shape_hash"
+)
+writer = trip_shape.write.mode("overwrite").partitionBy("static_date")
+if REBUILD:
+    writer.option("overwriteSchema", "true").saveAsTable(TRIP_SHAPE)
+else:
+    writer.option("partitionOverwriteMode", "dynamic").saveAsTable(TRIP_SHAPE)

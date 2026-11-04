@@ -1,7 +1,9 @@
 # Databricks notebook source
 dbutils.widgets.text("catalog", "transit_dev")
 dbutils.widgets.text("bronze_catalog", "transit")
+dbutils.widgets.text("full_refresh", "false")
 CATALOG = dbutils.widgets.get("catalog")
+FULL_REFRESH = dbutils.widgets.get("full_refresh") == "true"
 BRONZE = f"{dbutils.widgets.get('bronze_catalog')}.bronze.vehicle_positions"
 TABLE = f"{CATALOG}.silver.vehicle_segments"
 
@@ -20,10 +22,38 @@ LON_MIN, LON_MAX = 12.20, 12.75
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.silver")
 
 # COMMAND ----------
-# Distance between two points
+# Days to compute
+
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from pyspark.sql import Window
 from pyspark.sql import functions as F
+
+TODAY = datetime.now(ZoneInfo("Europe/Rome")).date()
+EARLIEST = TODAY - timedelta(days=HISTORY_DAYS)
+REBUILD = FULL_REFRESH or not spark.catalog.tableExists(TABLE)
+
+
+def days_to_process(table):
+    """Returns the range of new complete days not yet written to the table, or None if there are none."""
+    start = EARLIEST
+    if not REBUILD:
+        latest = spark.table(table).agg(F.max("date_rome")).first()[0]
+        if latest:
+            start = max(latest + timedelta(days=1), EARLIEST)
+    end = TODAY - timedelta(days=1)
+    return (start, end) if start <= end else None
+
+
+DAYS = days_to_process(TABLE)
+if not DAYS:
+    dbutils.notebook.exit("up to date")
+START, END = DAYS
+print(f"computing {START} to {END}")
+
+# COMMAND ----------
+# Distance between two points
 
 EARTH_RADIUS_M = 6371000
 
@@ -46,7 +76,7 @@ same_ping = Window.partitionBy("vehicle_id", "vehicle_timestamp").orderBy(
 
 points = (
     spark.table(BRONZE)
-    .where(F.col("date") >= F.date_sub(F.current_date(), HISTORY_DAYS))
+    .where(F.col("date").between(START - timedelta(days=1), END))
     .where(F.col("vehicle_timestamp").isNotNull())
     .where(F.col("vehicle_id").isNotNull())
     .where(F.col("latitude").between(LAT_MIN, LAT_MAX))
@@ -110,6 +140,17 @@ silver = segments.select(
     F.hour(F.from_utc_timestamp("vehicle_timestamp", "Europe/Rome")).alias("hour_rome"),
 )
 
-silver.write.mode("overwrite").option("overwriteSchema", "true").partitionBy(
-    "date_rome"
-).saveAsTable(TABLE)
+silver = silver.where(F.col("date_rome").between(START, END))
+
+writer = silver.write.mode("overwrite").partitionBy("date_rome")
+if REBUILD:
+    writer.option("overwriteSchema", "true").saveAsTable(TABLE)
+else:
+    writer.option(
+        "replaceWhere", f"date_rome BETWEEN '{START}' AND '{END}'"
+    ).saveAsTable(TABLE)
+
+# COMMAND ----------
+# Drop days outside the history window
+
+spark.sql(f"DELETE FROM {TABLE} WHERE date_rome < '{EARLIEST}'")
