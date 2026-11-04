@@ -59,8 +59,8 @@ flowchart LR
     fn --> raw[("ADLS Gen2<br>raw")]
 
     subgraph dbx["Azure Databricks · Unity Catalog · Delta Lake"]
-        bronze["Bronze<br>every vehicle position, as delivered"] --> silver["Silver<br>vehicle speeds<br>routes · streets"]
-        silver --> gold["Gold<br>median speed per street,<br>weekday and hour"]
+        bronze["Bronze<br>every vehicle position, as delivered"] --> silver["Silver<br>vehicle speeds · route lines · streets<br>speeds matched to streets"]
+        silver --> gold["Gold<br>median speed per street,<br>weekday and hour<br>checked before publishing"]
     end
 
     raw -- "vehicle positions" --> bronze
@@ -76,25 +76,35 @@ flowchart LR
 |---|---|---|
 | **Ingestion** | [`ingestion/function_app`](ingestion/function_app/function_app.py) | Every 20 s an Azure Function downloads the vehicle positions feed and stores each snapshot as a file in ADLS Gen2, partitioned by date and hour. Once a day it stores the schedules and route lines. |
 | **Bronze** | [`bronze_vehicle_positions`](transform/bronze_vehicle_positions.py) | Parses those files into a Delta table, one row per vehicle with every field Rome fills. Loads incrementally with Auto Loader: each run reads only files it has not seen. |
-| **Silver** | [`silver_vehicle_segments`](transform/silver_vehicle_segments.py) | Removes duplicate and outdated positions, then calculates each vehicle's speed between its consecutive positions on a trip. |
+| **Silver** | [`silver_vehicle_segments`](transform/silver_vehicle_segments.py) | Removes duplicate and outdated positions, then calculates each vehicle's speed between its consecutive positions on a trip. Each run adds only the finished days the table does not have yet. |
 | | [`silver_streets`](transform/silver_streets.py) | Pulls Rome's street network from OpenStreetMap. |
-| | [`silver_route_streets`](transform/silver_route_streets.py) | Matches each bus and tram route to the streets it runs on. |
-| **Gold** | [`gold_street_speed`](transform/gold_street_speed.py) | Matches each speed measurement to the nearest street on its route, then calculates the median speed for every street, weekday and hour. Runs quality checks and exports the result for the map. |
+| | [`silver_route_streets`](transform/silver_route_streets.py) | Matches each bus and tram route line to the streets it runs on. A line is matched once and reused while its geometry stays the same. |
+| | [`silver_segment_streets`](transform/silver_segment_streets.py) | Matches each speed measurement of a new day to the nearest street on its route. |
+| **Gold** | [`gold_street_speed`](transform/gold_street_speed.py) | Calculates the median speed for every street, weekday and hour, checks the result and exports it for the map. |
 | **Serving** | [`app/map.py`](app/map.py) | A Streamlit app on Community Cloud reads the data from a private container and draws the map. |
 
 ## Design decisions
 
-- **The feed is checked every 20 s.** Rome publishes new positions about every 30 s, so
-  checking more often means no update is missed. Each update is saved under its own
-  timestamp, so downloading it twice creates no duplicate.
-- **Speed is calculated, not read.** Only about 20 % of vehicles report a speed, and those
-  values are noisy, some over 200 km/h. Speed comes from the distance and time between
-  consecutive positions.
+- **Each run processes only new data.** Bronze reads only the files it has not seen. Silver
+  adds only the finished days its tables do not have yet. A route line is matched to streets
+  once and reused while its geometry stays the same.
+- **Results are checked before they are published.** Gold writes the new figures to a staging
+  table, checks them and only then replaces the published table and the map's files.
 - **Speeds are matched only to streets on the vehicle's route.** The nearest street is often
   a side street or a crossing. Limiting the match to the route's own streets keeps each
   speed on the street the vehicle actually drove.
+- **Speed is calculated, not read.** Only about 20 % of vehicles report a speed, and those
+  values are noisy. Speed comes from the distance and time between
+  consecutive positions.
 - **Median, not mean.** Most measurements cluster near stops and lights, with a few fast ones.
   The median shows the typical speed and is not pulled by outliers.
+- **Trips are also looked up in the next day's schedule.** The schedule for a day often
+  lacks some of its trips, which appear only in the next day's release. Without this, some
+  days would lose up to 15 % of their measurements. So each day is processed once the next day's
+  schedule has arrived.
+- **The feed is checked every 20 s.** Rome publishes new positions about every 30 s, so
+  checking more often means no update is missed. Each update is saved under its own
+  timestamp, so downloading it twice creates no duplicate.
 - **The map's data is not public.** The app loads it from a private storage container
   with a read-only key. A public link would let anyone download the files without limit,
   and every download is billed. The app fetches the data at most once an hour.
@@ -102,8 +112,10 @@ flowchart LR
 ## Data quality
 
 If no new positions arrive for an hour, the daily run stops before anything is recalculated.
-Before publishing, the results are checked for impossible values, duplicates and speeds
-placed too far from their street, and if a check fails the map keeps the previous data.
+A schedule release much smaller than the previous one is treated as truncated and skipped,
+and its days use the previous release. Before publishing, the run checks that yesterday has
+enough measurements compared with a usual day and that the map has not lost streets. If a check
+fails, the map does not update.
 A street gets a speed for a weekday and hour only from at least 20 measurements.
 
 ## Repository layout
@@ -138,10 +150,15 @@ databricks bundle run daily          # run the dev job
 databricks bundle deploy -t prod
 ```
 
+The first run, and every run after the street network is updated, needs `full_refresh=true`,
+which rebuilds the last 90 days instead of adding the new ones:
+
+```bash
+databricks bundle run daily -t prod --params full_refresh=true
+```
+
 ## Possible improvements
 
-- Draw whole streets instead of street pieces.
-- Extend incremental loading from bronze to silver and gold.
 - Add other cities that publish their transit data in the same GTFS format.
 
 ## License and acknowledgments
